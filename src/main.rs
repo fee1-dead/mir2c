@@ -7,13 +7,13 @@
 
 use std::borrow::Cow;
 use std::env;
-use std::fmt::{self, Display, Write};
+use std::fmt::{Write};
 use std::path::Path;
-use std::{io, iter, mem};
+use std::{io, mem};
 
-use rustc_const_eval::interpret::{get_slice_bytes, AllocRange, ConstValue};
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_const_eval::interpret::{get_slice_bytes, ConstValue};
+use rustc_data_structures::fx::{FxIndexMap};
+
 use rustc_driver::Callbacks;
 use rustc_interface::interface::Compiler;
 use rustc_interface::Queries;
@@ -22,13 +22,13 @@ use rustc_middle::mir::pretty::write_mir_fn;
 use rustc_middle::mir::{
     self, BinOp::*, Constant, ConstantKind, HasLocalDecls, Operand, Place, Rvalue, Terminator,
 };
-use rustc_middle::ty::subst::Subst;
+
 use rustc_middle::ty::{
-    self, Const, FnSig, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TypeAndMut,
+    self, Instance, ParamEnv, Ty, TyCtxt, TypeAndMut,
 };
-use rustc_span::def_id::DefId;
+
 use rustc_span::{sym, Symbol};
-use rustc_target::abi::Size;
+
 use rustc_target::spec::abi::Abi;
 
 extern crate rustc_const_eval;
