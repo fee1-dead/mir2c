@@ -10,4 +10,4 @@ cargo run \
 -O \
 a.rs \
 --extern libc=/home/beef/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/liblibc-84f70e829012df9d.rlib \
-| tee >(gcc -x c -)
+| tee >(clang -x c -)

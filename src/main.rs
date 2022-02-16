@@ -9,8 +9,9 @@ use std::borrow::Cow;
 use std::env;
 use std::fmt::{self, Display, Write};
 use std::path::Path;
-use std::{io, mem};
+use std::{io, iter, mem};
 
+use rustc_const_eval::interpret::{get_slice_bytes, AllocRange, ConstValue};
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_driver::Callbacks;
@@ -18,13 +19,19 @@ use rustc_interface::interface::Compiler;
 use rustc_interface::Queries;
 use rustc_middle::mir::mono::{CodegenUnit, MonoItem};
 use rustc_middle::mir::pretty::write_mir_fn;
-use rustc_middle::mir::{self, BinOp::*, Constant, ConstantKind, HasLocalDecls, Operand, Rvalue, Terminator};
+use rustc_middle::mir::{
+    self, BinOp::*, Constant, ConstantKind, HasLocalDecls, Operand, Place, Rvalue, Terminator,
+};
 use rustc_middle::ty::subst::Subst;
-use rustc_middle::ty::{self, Const, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TypeAndMut, FnSig};
+use rustc_middle::ty::{
+    self, Const, FnSig, Instance, InstanceDef, ParamEnv, Ty, TyCtxt, TypeAndMut,
+};
 use rustc_span::def_id::DefId;
-use rustc_span::{Symbol, sym};
+use rustc_span::{sym, Symbol};
+use rustc_target::abi::Size;
 use rustc_target::spec::abi::Abi;
 
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_interface;
@@ -36,6 +43,7 @@ struct Mir2c;
 
 struct State<'tcx> {
     tcx: TyCtxt<'tcx>,
+    h: String,
     slice_types: FxIndexMap<Ty<'tcx>, usize>,
     slices: usize,
     s: String,
@@ -55,6 +63,7 @@ impl<'tcx> State<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         let mut state = State {
             tcx,
+            h: String::new(),
             slice_types: FxIndexMap::default(),
             slices: 0,
             s: String::new(),
@@ -64,25 +73,16 @@ impl<'tcx> State<'tcx> {
     }
 
     fn header(&mut self) {
-        self.s.push_str(
-            "
-            #include <stdint.h>
-            typedef struct {} __unitty;
-        "
-            .trim(),
-        );
+        self.h.push_str(include_str!("header.c"));
     }
 
     fn build(mut self) -> String {
-        let mut header = String::new();
+        let mut header = mem::take(&mut self.h);
         while !self.slice_types.is_empty() {
             for (ty, n) in mem::take(&mut self.slice_types) {
                 write!(
                     header,
-                    "struct __slice_{n} {{
-                    {}* ptr;
-                    size_t len;
-                }}",
+                    "struct __slice_{n} {{{}* ptr;size_t len;}};",
                     self.ty(ty)
                 )
                 .unwrap();
@@ -90,6 +90,14 @@ impl<'tcx> State<'tcx> {
         }
         header.push_str(&self.s);
         header
+    }
+
+    fn slice_n(&mut self, elem: Ty<'tcx>) -> usize {
+        *self.slice_types.entry(elem).or_insert_with(|| {
+            let prev = self.slices;
+            self.slices += 1;
+            prev
+        })
     }
 
     #[must_use]
@@ -101,20 +109,10 @@ impl<'tcx> State<'tcx> {
             ty::Int(ty::IntTy::I32) => "int32_t".into(),
             ty::Int(ty::IntTy::Isize) => "int".into(), // TODO sus
             ty::Ref(_, ty, _) if let ty::Slice(elem) = ty.kind() => {
-                let n = *self.slice_types.entry(elem).or_insert_with(|| {
-                    let prev = self.slices;
-                    self.slices += 1;
-                    prev
-                });
-                format!("struct __slice_{n}").into()
+                format!("struct __slice_{}", self.slice_n(elem)).into()
             }
             ty::RawPtr(TypeAndMut { ty, .. }) if let ty::Slice(elem) = ty.kind() => {
-                let n = *self.slice_types.entry(elem).or_insert_with(|| {
-                    let prev = self.slices;
-                    self.slices += 1;
-                    prev
-                });
-                format!("struct __slice_{n}").into()
+                format!("struct __slice_{}", self.slice_n(elem)).into()
             }
             ty::RawPtr(TypeAndMut { ty, mutbl: _ }) => {
                 format!("{}*", self.ty(ty)).into()
@@ -124,17 +122,54 @@ impl<'tcx> State<'tcx> {
         }
     }
 
+    fn konst(&mut self, konst: &ty::Const<'tcx>) {
+        if konst.ty.is_integral() {
+            let int = konst.val.try_to_scalar_int().unwrap();
+            write!(self.s, "{}", int.to_bits(int.size()).unwrap()).unwrap();
+        } else {
+            if let ty::Ref(_, ty, _) = konst.ty.kind() {
+                if let ty::Slice(elem) = ty.kind() {
+                    if !matches!(elem.kind(), ty::Uint(ty::UintTy::U8)) {
+                        // figure out elements length
+                        unimplemented!("{elem:?}");
+                    }
+
+                    if let ty::ConstKind::Value(cv) = konst.val {
+                        let ConstValue::Slice { data, .. } = &cv else { panic!() };
+                        let bytes = get_slice_bytes(&self.tcx, cv);
+                        if !data.relocations().is_empty() {
+                            unimplemented!();
+                        }
+
+                        let len = data.len();
+                        let name = format!("_allocation_{len}");
+                        write!(self.h, "unsigned char {name}[{}] = {{", self.h.len()).unwrap();
+
+                        for (n, byte) in bytes.iter().enumerate() {
+                            if n != 0 {
+                                self.h.push(',');
+                            }
+
+                            write!(self.h, "{byte}").unwrap();
+                        }
+
+                        self.h.push_str("};");
+
+                        let n = self.slice_n(elem);
+
+                        write!(self.s, "(struct __slice_{n}){{.ptr = {name},.len = {len}}}").unwrap();
+                        return;
+                    }
+                }
+            }
+            unimplemented!("{konst:?}");
+        }
+    }
+
     fn operand(&mut self, op: &Operand<'tcx>) {
         match op {
             Operand::Constant(box mir::Constant { literal, .. }) => match literal {
-                ConstantKind::Ty(const_) => {
-                    if const_.ty.is_integral() {
-                        let int = const_.val.try_to_scalar_int().unwrap();
-                        write!(self.s, "{}", int.to_bits(int.size()).unwrap()).unwrap();
-                    } else {
-                        unimplemented!();
-                    }
-                }
+                ConstantKind::Ty(konst) => self.konst(konst),
                 ConstantKind::Val(_, _) => todo!(),
             },
             Operand::Copy(p) => {
@@ -153,14 +188,43 @@ impl<'tcx> State<'tcx> {
         }
     }
 
-    fn rvalue(&mut self, rvalue: &Rvalue<'tcx>) {
+    fn rvalue(&mut self, mir: &mir::Body<'tcx>, rvalue: &Rvalue<'tcx>) {
         match rvalue {
             Rvalue::Use(op) => {
                 self.operand(op);
             }
+            Rvalue::Cast(mir::CastKind::Misc, op, ty) if let ty::RawPtr(TypeAndMut { ty: pointee, .. }) = ty.kind() => {
+                let Operand::Move(pl) = op else { unimplemented!() };
+                let local = pl.as_local().unwrap();
+                
+                if let ty::RawPtr(TypeAndMut { ty: pointee_from, .. }) = mir.local_decls()[local].ty.kind() {
+                    if let ty::Slice(elem) = pointee_from.kind() {
+                        // we have a wrapper struct for the slice ref type. We retrive the pointer from the slice struct
+                        assert_eq!(pointee, elem);
+                        self.operand(op);
+                        self.s.push_str(".ptr");
+                    } else {
+                        // normal pointer cast
+                        self.s.push_str("((");
+                        let ty = self.ty(ty);
+                        self.s.push_str(&ty);
+                        self.s.push(')');
+                        self.operand(op);
+                        self.s.push(')');
+                    }
+                } else {
+                    todo!()
+                }
+            }
+            Rvalue::AddressOf(_, Place { local, projection })
+                if projection.len() == 1 && matches!(projection[0], mir::ProjectionElem::Deref) => {
+                // reference to raw pointer. do nothing in C.
+                write!(self.s, "{local:?}").unwrap();
+            }
             Rvalue::BinaryOp(binop, box (op, op1)) => {
                 self.operand(op);
-                self.s.push_str(match binop { // TODO overflow behavior
+                self.s.push_str(match binop {
+                    // TODO overflow behavior
                     Add => "+",
                     Sub => "-",
                     Mul => "*",
@@ -198,7 +262,6 @@ impl<'tcx> State<'tcx> {
             ty::ParamEnv::reveal_all(),
             self.tcx.instance_mir(instance.def).clone(),
         );
-
 
         let locals = mir.local_decls();
         let ty = self.ty(mir.return_ty());
@@ -314,7 +377,7 @@ impl<'tcx> State<'tcx> {
                         }
 
                         write!(self.s, "{:?} = ", place.local).unwrap();
-                        self.rvalue(rvalue);
+                        self.rvalue(&mir, rvalue);
                         self.s.push(';');
                     }
                     mir::StatementKind::StorageDead(_) | mir::StatementKind::StorageLive(_) => {}
@@ -323,7 +386,7 @@ impl<'tcx> State<'tcx> {
             }
 
             self.terminator(&mir, bb.terminator());
-            
+
             self.s.push('}');
         }
 
@@ -333,7 +396,9 @@ impl<'tcx> State<'tcx> {
 
     fn prototype(&mut self, item: &MonoItem<'tcx>) {
         if let MonoItem::Fn(instance) = item {
-            if self.instance_header(instance).is_none() { return };
+            if self.instance_header(instance).is_none() {
+                return;
+            };
             self.s.push(';');
         }
     }
