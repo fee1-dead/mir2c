@@ -7,12 +7,14 @@
 
 use std::borrow::Cow;
 use std::env;
-use std::fmt::{Write};
-use std::path::Path;
+use std::fmt::Write;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::process::{Command, exit};
 use std::{io, mem};
 
 use rustc_const_eval::interpret::{get_slice_bytes, ConstValue};
-use rustc_data_structures::fx::{FxIndexMap};
+use rustc_data_structures::fx::FxIndexMap;
 
 use rustc_driver::Callbacks;
 use rustc_interface::interface::Compiler;
@@ -23,9 +25,8 @@ use rustc_middle::mir::{
     self, BinOp::*, Constant, ConstantKind, HasLocalDecls, Operand, Place, Rvalue, Terminator,
 };
 
-use rustc_middle::ty::{
-    self, Instance, ParamEnv, Ty, TyCtxt, TypeAndMut,
-};
+use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::{self, Instance, ParamEnv, Ty, TyCtxt, TypeAndMut};
 
 use rustc_span::{sym, Symbol};
 
@@ -44,8 +45,8 @@ struct Mir2c;
 struct State<'tcx> {
     tcx: TyCtxt<'tcx>,
     h: String,
-    slice_types: FxIndexMap<Ty<'tcx>, usize>,
-    slices: usize,
+    types_to_compute: FxIndexMap<Ty<'tcx>, usize>,
+    types: usize,
     s: String,
 }
 
@@ -64,8 +65,8 @@ impl<'tcx> State<'tcx> {
         let mut state = State {
             tcx,
             h: String::new(),
-            slice_types: FxIndexMap::default(),
-            slices: 0,
+            types_to_compute: FxIndexMap::default(),
+            types: 0,
             s: String::new(),
         };
         state.header();
@@ -78,24 +79,48 @@ impl<'tcx> State<'tcx> {
 
     fn build(mut self) -> String {
         let mut header = mem::take(&mut self.h);
-        while !self.slice_types.is_empty() {
-            for (ty, n) in mem::take(&mut self.slice_types) {
-                write!(
-                    header,
-                    "struct __slice_{n} {{{}* ptr;size_t len;}};",
-                    self.ty(ty)
-                )
-                .unwrap();
+        while !self.types_to_compute.is_empty() {
+            for (ty, n) in mem::take(&mut self.types_to_compute) {
+                match ty.kind() {
+                    ty::Slice(elem) => {
+                        write!(
+                            header,
+                            "struct __slice_{n} {{{}* ptr;size_t len;}};",
+                            self.ty(*elem)
+                        )
+                        .unwrap();
+                    }
+                    // TODO: Transform all references in MIR to raw pointers
+
+                    ty::Adt(def, subst) => {
+                        if def.is_union() {
+                            todo!()
+                        } else if def.is_enum() {
+                            unimplemented!()
+                        } else {
+                            let fields = def.non_enum_variant();
+                            write!(header, "struct __adt_{n} {{").unwrap();
+                            for field in &def.non_enum_variant().fields {
+                                let ty = field.ty(self.tcx, subst);
+                                header.push_str(&self.ty(ty));
+                                write!(header, " {};", field.name).unwrap();
+                            }
+                            header.push_str("};");
+                        }
+                        
+                    }
+                    _ => panic!(),
+                }
             }
         }
         header.push_str(&self.s);
         header
     }
 
-    fn slice_n(&mut self, elem: Ty<'tcx>) -> usize {
-        *self.slice_types.entry(elem).or_insert_with(|| {
-            let prev = self.slices;
-            self.slices += 1;
+    fn n_of_ty(&mut self, elem: Ty<'tcx>) -> usize {
+        *self.types_to_compute.entry(elem).or_insert_with(|| {
+            let prev = self.types;
+            self.types += 1;
             prev
         })
     }
@@ -108,33 +133,45 @@ impl<'tcx> State<'tcx> {
             ty::Int(ty::IntTy::I8) => "char".into(),
             ty::Int(ty::IntTy::I32) => "int32_t".into(),
             ty::Int(ty::IntTy::Isize) => "int".into(), // TODO sus
-            ty::Ref(_, ty, _) if let ty::Slice(elem) = ty.kind() => {
-                format!("struct __slice_{}", self.slice_n(elem)).into()
+            ty::Ref(_, slice, _) if let ty::Slice(elem) = slice.kind() => {
+                format!("struct __slice_{}", self.n_of_ty(*slice)).into()
             }
-            ty::RawPtr(TypeAndMut { ty, .. }) if let ty::Slice(elem) = ty.kind() => {
-                format!("struct __slice_{}", self.slice_n(elem)).into()
+            ty::RawPtr(TypeAndMut { ty: slice, .. }) if let ty::Slice(elem) = slice.kind() => {
+                format!("struct __slice_{}", self.n_of_ty(*slice)).into()
             }
-            ty::RawPtr(TypeAndMut { ty, mutbl: _ }) => {
-                format!("{}*", self.ty(ty)).into()
+            ty::RawPtr(TypeAndMut { ty, mutbl: _ }) | ty::Ref(_, ty, _) => {
+                format!("{}*", self.ty(*ty)).into()
             }
             ty::Never => "char".into(), // TODO ??
+            ty::Bool => "bool".into(),
+            ty::Adt(def, substs) => {
+                // we could compute the layout of the type and follow that, but currently we just lay out the fields in order.
+                if def.is_enum() {
+
+                } else {
+                    for f in def.all_fields() {
+
+                    }
+                }
+                todo!()
+            }
             ty => unimplemented!("{ty:?}"),
         }
     }
 
     fn konst(&mut self, konst: &ty::Const<'tcx>) {
-        if konst.ty.is_integral() {
-            let int = konst.val.try_to_scalar_int().unwrap();
+        if konst.ty().is_integral() {
+            let int = konst.val().try_to_scalar_int().unwrap();
             write!(self.s, "{}", int.to_bits(int.size()).unwrap()).unwrap();
         } else {
-            if let ty::Ref(_, ty, _) = konst.ty.kind() {
+            if let ty::Ref(_, ty, _) = konst.ty().kind() {
                 if let ty::Slice(elem) = ty.kind() {
                     if !matches!(elem.kind(), ty::Uint(ty::UintTy::U8)) {
-                        // figure out elements length
+                        // TODO figure out elements length
                         unimplemented!("{elem:?}");
                     }
 
-                    if let ty::ConstKind::Value(cv) = konst.val {
+                    if let ty::ConstKind::Value(cv) = konst.val() {
                         let ConstValue::Slice { data, .. } = &cv else { panic!() };
                         let bytes = get_slice_bytes(&self.tcx, cv);
                         if !data.relocations().is_empty() {
@@ -155,9 +192,10 @@ impl<'tcx> State<'tcx> {
 
                         self.h.push_str("};");
 
-                        let n = self.slice_n(elem);
+                        let n = self.n_of_ty(*ty);
 
-                        write!(self.s, "(struct __slice_{n}){{.ptr = {name},.len = {len}}}").unwrap();
+                        write!(self.s, "(struct __slice_{n}){{.ptr = {name},.len = {len}}}")
+                            .unwrap();
                         return;
                     }
                 }
@@ -206,7 +244,7 @@ impl<'tcx> State<'tcx> {
                     } else {
                         // normal pointer cast
                         self.s.push_str("((");
-                        let ty = self.ty(ty);
+                        let ty = self.ty(*ty);
                         self.s.push_str(&ty);
                         self.s.push(')');
                         self.operand(op);
@@ -263,6 +301,8 @@ impl<'tcx> State<'tcx> {
             self.tcx.instance_mir(instance.def).clone(),
         );
 
+        let guard = DumpMirGuard(tcx, &mir);
+
         let locals = mir.local_decls();
         let ty = self.ty(mir.return_ty());
         write!(self.s, "{ty} {}(", tcx.symbol_name(*instance)).unwrap();
@@ -274,6 +314,8 @@ impl<'tcx> State<'tcx> {
             write!(self.s, "{ty} {l:?}").unwrap();
         }
         self.s.push(')');
+
+        mem::forget(guard);
 
         Some(mir)
     }
@@ -293,12 +335,26 @@ impl<'tcx> State<'tcx> {
                 write!(self.s, "goto {target:?};").unwrap();
             }
 
+            mir::TerminatorKind::SwitchInt { discr, switch_ty, targets } => {
+                if !switch_ty.is_integral() {
+                    todo!();
+                }
+
+                self.s.push_str("switch(");
+                self.operand(discr);
+                self.s.push_str("){");
+                for (value, target) in targets.iter() {
+                    write!(self.s, "case {value}: goto {target:?};", ).unwrap();
+                }
+                write!(self.s, "default: goto {:?};}}", targets.otherwise()).unwrap();
+            }
+
             mir::TerminatorKind::Call {
                 func: Operand::Constant(box Constant { literal: ConstantKind::Ty(konst), .. }),
                 args,
                 destination,
                 ..
-            } if let &ty::FnDef(def_id, substs) = konst.ty.kind() => {
+            } if let &ty::FnDef(def_id, substs) = konst.ty().kind() => {
                 match tcx.fn_sig(def_id).abi() {
                     Abi::Rust | Abi::C { unwind: false } => {}
                     Abi::RustIntrinsic => {
@@ -447,14 +503,131 @@ impl Callbacks for Mir2c {
 
 fn main() {
     rustc_driver::init_rustc_env_logger();
-    let mut args: Vec<_> = env::args().collect();
+    let mut orig_args: Vec<_> = env::args().collect();
+
+    // <---------------------- START CLIPPY COPYPASTA ---------------------->
+    // | https://github.com/rust-lang/rust-clippy/blob/master/src/driver.rs |
+    // ----------------------------------------------------------------------
+    //
+    /// If a command-line option matches `find_arg`, then apply the predicate `pred` on its value. If
+    /// true, then return it. The parameter is assumed to be either `--arg=value` or `--arg value`.
+    fn arg_value<'a, T: Deref<Target = str>>(
+        args: &'a [T],
+        find_arg: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<&'a str> {
+        let mut args = args.iter().map(Deref::deref);
+        while let Some(arg) = args.next() {
+            let mut arg = arg.splitn(2, '=');
+            if arg.next() != Some(find_arg) {
+                continue;
+            }
+
+            match arg.next().or_else(|| args.next()) {
+                Some(v) if pred(v) => return Some(v),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<PathBuf> {
+        home.and_then(|home| {
+            toolchain.map(|toolchain| {
+                let mut path = PathBuf::from(home);
+                path.push("toolchains");
+                path.push(toolchain);
+                path
+            })
+        })
+    }
+
+    fn display_help() {
+        println!(
+            "\
+    Transpiles your Rust code to C11 compliant code.
+    Usage:
+        cargo mir2c [options] [--] [<opts>...]
+    Common options:
+        -h, --help               Print this message
+        -V, --version            Print version info and exit
+    "
+        );
+    }
+
+    // Get the sysroot, looking from most specific to this invocation to the least:
+    // - command line
+    // - runtime environment
+    //    - SYSROOT
+    //    - RUSTUP_HOME, MULTIRUST_HOME, RUSTUP_TOOLCHAIN, MULTIRUST_TOOLCHAIN
+    // - sysroot from rustc in the path
+    // - compile-time environment
+    //    - SYSROOT
+    //    - RUSTUP_HOME, MULTIRUST_HOME, RUSTUP_TOOLCHAIN, MULTIRUST_TOOLCHAIN
+    let sys_root_arg = arg_value(&orig_args, "--sysroot", |_| true);
+    let have_sys_root_arg = sys_root_arg.is_some();
+    let sys_root = sys_root_arg
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("SYSROOT").ok().map(PathBuf::from))
+        .or_else(|| {
+            let home = std::env::var("RUSTUP_HOME")
+                .or_else(|_| std::env::var("MULTIRUST_HOME"))
+                .ok();
+            let toolchain = std::env::var("RUSTUP_TOOLCHAIN")
+                .or_else(|_| std::env::var("MULTIRUST_TOOLCHAIN"))
+                .ok();
+            toolchain_path(home, toolchain)
+        })
+        .or_else(|| {
+            Command::new("rustc")
+                .arg("--print")
+                .arg("sysroot")
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|s| PathBuf::from(s.trim()))
+        })
+        .or_else(|| option_env!("SYSROOT").map(PathBuf::from))
+        .or_else(|| {
+            let home = option_env!("RUSTUP_HOME")
+                .or(option_env!("MULTIRUST_HOME"))
+                .map(ToString::to_string);
+            let toolchain = option_env!("RUSTUP_TOOLCHAIN")
+                .or(option_env!("MULTIRUST_TOOLCHAIN"))
+                .map(ToString::to_string);
+            toolchain_path(home, toolchain)
+        })
+        .map(|pb| pb.to_string_lossy().to_string())
+        .expect(
+            "need to specify SYSROOT env var during mir2c compilation, or use rustup or multirust",
+        );
+
+    // Setting RUSTC_WRAPPER causes Cargo to pass 'rustc' as the first argument.
+    // We're invoking the compiler programmatically, so we ignore this/
     let wrapper_mode =
-        args.get(1).map(Path::new).and_then(Path::file_stem) == Some("rustc".as_ref());
+        orig_args.get(1).map(Path::new).and_then(Path::file_stem) == Some("rustc".as_ref());
 
     if wrapper_mode {
         // we still want to be able to invoke it normally though
-        args.remove(1);
+        orig_args.remove(1);
     }
+
+    if !wrapper_mode && (orig_args.iter().any(|a| a == "--help" || a == "-h") || orig_args.len() == 1) {
+        display_help();
+        exit(0);
+    }
+
+    // this conditional check for the --sysroot flag is there so users can call
+    // `mir2c` directly
+    // without having to pass --sysroot or anything
+    let mut args: Vec<String> = orig_args.clone();
+    if !have_sys_root_arg {
+        args.extend(vec!["--sysroot".into(), sys_root]);
+    };
+
+    // <----------------------- END CLIPPY COPYPASTA ----------------------->
+    // | https://github.com/rust-lang/rust-clippy/blob/master/src/driver.rs |
+    // ----------------------------------------------------------------------
 
     rustc_driver::RunCompiler::new(&args, &mut Mir2c)
         .run()
